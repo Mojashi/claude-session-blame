@@ -7,6 +7,7 @@ with uncommitted changes and nobody knows whose they are. This adds:
 
 - a Claude Code hook that logs every file a session touches to `~/.claude/touch-log.jsonl`
 - **`cls`**: `ls` / `git status` with the session that last touched each file
+- **`cls -w`**: a live timeline of what every session is touching right now
 - an optional git hook that stamps commits with `Claude-Session: <id>` trailers
 
 ```
@@ -19,6 +20,22 @@ $ cls -g
 
 The title is the session's name in Claude Code (custom title, else the auto-generated
 one). The same session always gets the same color.
+
+### `cls -w`: watch every session at once
+
+![cls -w](docs/watch.svg)
+
+- **Sessions**: one lane per session with an activity sparkline (`+`/`-` changes the span
+  from 15 minutes to 8 hours). `●` was busy in the last 10 minutes; it blinks while the
+  session is touching files right now.
+- **Contested**: files that more than one session touched in the last 30 minutes. These
+  are the ones about to collide. `○~` means that session only shows up through Bash
+  inference (see Limits).
+- **Timeline**: every touch, newest first. A Bash command that changed several files is
+  one row (`+N`), and new rows flash.
+
+`space` pauses, `q` quits. `cls -w PATH` limits the view to a directory. Piped
+(`cls -w | grep …`), it streams one line per touch instead.
 
 ## Install
 
@@ -45,6 +62,7 @@ pick them up.
 cls [-a] [-l] [PATH...]   # list a directory; a directory row shows its newest touch
 cls -g [-l]               # files git status reports as changed
 cls -s SESSION [PATH]     # every file one session touched (id prefix is enough)
+cls -w [PATH...]          # live timeline (q quits)
 ```
 
 - `-l` shows every session that touched the file instead of only the latest (`(+N)`)
@@ -72,14 +90,15 @@ git log --format='%h %s %(trailers:key=Claude-Session,valueonly,separator=%x2C )
 Each touch is one JSON line:
 
 ```json
-{"ts": "2026-10-07T04:49:39Z", "session": "f9190186-…", "transcript": "~/.claude/projects/…/f9190186-….jsonl", "cwd": "/repo", "tool": "Write", "file": "/repo/a.txt"}
+{"ts": "2026-10-07T04:49:39Z", "t": 1791348579.123, "session": "f9190186-…", "transcript": "~/.claude/projects/…/f9190186-….jsonl", "cwd": "/repo", "tool": "Write", "file": "/repo/a.txt"}
 ```
 
 ### Limits
 
-- **Bash attribution is a heuristic.** If another process (another session, your editor,
-  a watcher) changes a file while a Bash command runs, that file is attributed to the
-  session too. Only files that `git status` lists in the repo of the session's working
+- **Bash attribution is a heuristic.** If another process (another session's Bash, your
+  editor, a watcher) changes a file while a Bash command runs, that file is attributed to
+  the session too. Files another session wrote with Edit / Write in that window are
+  excluded. Only files that `git status` lists in the repo of the session's working
   directory are seen. Gitignored files, files outside a repo, and edits after a
   `cd` into another repo are missed. Background commands (`run_in_background`) are only
   observed until they start.
@@ -109,6 +128,7 @@ rm .git/hooks/commit-msg   # in each repo where you ran --git-hook
 ./install.sh                 # hook と cls を入れる
 ./install.sh --git-hook .    # このリポジトリの commit に trailer を付ける
 cls -g                       # 変更ファイルにセッションを付けて表示
+cls -w                       # 全セッションの作業をリアルタイムで眺めるタイムライン
 cls -s <session-id>          # そのセッションが触ったファイル一覧
 ```
 

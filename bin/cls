@@ -4,9 +4,11 @@
   cls [-a] [-l] [PATH...]   list a directory (a directory row shows its newest touch)
   cls -g [-l]               list the files `git status` reports as changed
   cls -s SESSION [PATH]     list the files one session touched (prefix match on the id)
+  cls -w [PATH...]          live timeline of every session's touches (q to quit)
 
   -a  include hidden files
   -l  show every session that touched the file, newest first
+  --span MIN  sparkline window for -w (15/30/60/120/240/480, default 60; +/- while watching)
 
 Reads $CLAUDE_CONFIG_DIR/touch-log.jsonl (default ~/.claude/touch-log.jsonl), written
 by the session-blame hooks. A "~" before the session id marks a touch inferred from a
@@ -25,7 +27,7 @@ from datetime import datetime, timezone
 
 CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
 LOG = os.path.join(CLAUDE_DIR, "touch-log.jsonl")
-TITLE_KEYS = ('"type":"custom-title"', '"type":"ai-title"')
+TITLE_KEYS = ("custom-title", "ai-title")  # cheap prefilter before json.loads
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
 
 
@@ -297,6 +299,434 @@ def session_mode(args, index):
         print(f"  {pad(ago(ts[0].ts), 8)}{ts[0].mark}{show_path(p, cwd)}{gone}")
 
 
+# ---- watch ---------------------------------------------------------------
+#
+# `cls -w`: a live timeline. Three panels, top to bottom:
+#   SESSIONS   one lane per session: activity sparkline over the last --span minutes
+#   CONTESTED  files more than one session touched recently (likely to collide)
+#   TIMELINE   every touch, newest first; just-arrived rows flash
+# Without a terminal (piped), it streams one line per touch instead.
+
+SPARK = " ▁▂▃▄▅▆▇█"
+TOOL_ICON = {"Edit": "✎", "MultiEdit": "✎", "NotebookEdit": "✎", "Write": "✚", "Bash": "$"}
+PALETTE_256 = [39, 208, 170, 114, 220, 75, 203, 141, 49, 214, 99, 43, 211, 154, 33, 178]
+PALETTE_8 = [6, 3, 5, 2, 4, 1]
+SPANS = [15, 30, 60, 120, 240, 480]
+CONTEST_WINDOW = 30 * 60
+FLASH_SECONDS = 6
+
+WATCH_MSG = {
+    "sessions": ("SESSIONS", "セッション"),
+    "contested": ("CONTESTED · touched by several sessions", "競合 · 複数のセッションが触ったファイル"),
+    "timeline": ("TIMELINE", "タイムライン"),
+    "files": ("{} files", "{} ファイル"),
+    "file": ("{} file", "{} ファイル"),
+    "session_count": ("{} sessions", "{} セッション"),
+    "touches": ("{} touches", "{} 件"),
+    "keys": ("q quit · space pause · +/- span", "q 終了 · space 一時停止 · +/- 期間"),
+    "paused": ("PAUSED", "一時停止中"),
+    "waiting": ("Waiting for Claude Code to touch a file…", "Claude Code がファイルを触るのを待っています…"),
+    "untitled": ("(untitled)", "(無題)"),
+}
+
+
+def wmsg(key, *a):
+    return WATCH_MSG[key][_LANG].format(*a)
+
+
+class Event:
+    __slots__ = ("ts", "session", "transcript", "tool", "file", "cwd")
+
+    def __init__(self, ts, session, transcript, tool, file, cwd):
+        self.ts, self.session, self.transcript = ts, session, transcript
+        self.tool, self.file, self.cwd = tool, file, cwd
+
+
+class LogTail:
+    """Follows touch-log.jsonl, keeping the events of the last `window` seconds."""
+
+    MAX_INITIAL_READ = 32 << 20
+
+    def __init__(self, window, scope):
+        self.window, self.scope = window, scope
+        self.events = []  # oldest first
+        self.pos, self.inode = 0, None
+        self._real = {}
+
+    def poll(self):
+        try:
+            st = os.stat(LOG)
+        except FileNotFoundError:
+            return []
+        if st.st_ino != self.inode or st.st_size < self.pos:  # rotated or truncated
+            self.inode = st.st_ino
+            self.pos = max(0, st.st_size - self.MAX_INITIAL_READ) if not self.events else 0
+        if st.st_size == self.pos:
+            self._prune()
+            return []
+        with open(LOG, "rb") as f:
+            f.seek(self.pos)
+            data = f.read(st.st_size - self.pos)
+        end = data.rfind(b"\n") + 1  # leave a half-written last line for the next poll
+        self.pos += end
+        fresh = []
+        horizon = time.time() - self.window
+        for line in data[:end].splitlines():
+            try:
+                e = json.loads(line)
+                ts = e["t"] if "t" in e else \
+                    datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+                raw = e["file"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not raw or ts < horizon:
+                continue
+            p = self._real.get(raw)
+            if p is None:
+                p = self._real[raw] = os.path.realpath(raw)
+            if self.scope and not any(p == s or p.startswith(s + os.sep) for s in self.scope):
+                continue
+            fresh.append(Event(ts, e.get("session") or "?", e.get("transcript"), e.get("tool") or "?",
+                               p, e.get("cwd")))
+        fresh.sort(key=lambda ev: ev.ts)
+        self.events.extend(fresh)
+        self._prune()
+        return fresh
+
+    def _prune(self):
+        horizon = time.time() - self.window
+        i = 0
+        while i < len(self.events) and self.events[i].ts < horizon:
+            i += 1
+        if i:
+            del self.events[:i]
+
+
+def clip(s, w):
+    """Cut s to at most w display columns."""
+    out, n = [], 0
+    for c in s:
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if n + cw > w:
+            break
+        out.append(c)
+        n += cw
+    return "".join(out)
+
+
+def clip_left(s, w):
+    """Keep the tail of s (the file name matters more than the directory)."""
+    if width(s) <= w:
+        return s
+    out, n = [], 1
+    for c in reversed(s):
+        cw = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if n + cw > w:
+            break
+        out.append(c)
+        n += cw
+    return "…" + "".join(reversed(out))
+
+
+def group_rows(events):
+    """Newest first; a burst of one session's tool call (one Bash touching many files) is one row."""
+    rows = []
+    for ev in reversed(events):
+        last = rows[-1] if rows else None
+        if last and last[0].session == ev.session and last[0].tool == ev.tool and last[0].ts - ev.ts <= 2:
+            last.append(ev)
+        else:
+            rows.append([ev])
+    return rows
+
+
+def session_lanes(events, now, span, buckets):
+    """[{session, last, files, cwd, counts}] most recently active first."""
+    lanes = {}
+    bucket_len = span / buckets
+    for ev in events:
+        lane = lanes.get(ev.session)
+        if lane is None:
+            lane = lanes[ev.session] = {"session": ev.session, "last": ev, "files": set(), "counts": [0] * buckets}
+        if ev.ts >= lane["last"].ts:
+            lane["last"] = ev
+        lane["files"].add(ev.file)
+        age = now - ev.ts
+        if 0 <= age < span:
+            lane["counts"][buckets - 1 - int(age // bucket_len)] += 1
+    return sorted(lanes.values(), key=lambda lane: lane["last"].ts, reverse=True)
+
+
+def contested_files(events, now):
+    """[(file, [(session, inferred_only)] newest first, last ts)] for files several sessions touched recently."""
+    by_file = {}
+    for ev in events:
+        if now - ev.ts <= CONTEST_WINDOW:
+            by_file.setdefault(ev.file, []).append(ev)
+    out = []
+    for f, evs in by_file.items():
+        sessions, exact = [], set()
+        for ev in sorted(evs, key=lambda e: e.ts, reverse=True):
+            if ev.session not in sessions:
+                sessions.append(ev.session)
+            if ev.tool != "Bash":
+                exact.add(ev.session)
+        if len(sessions) > 1:
+            out.append((f, [(s, s not in exact) for s in sessions], max(e.ts for e in evs)))
+    return sorted(out, key=lambda x: x[2], reverse=True)
+
+
+def sparkline(counts, peak):
+    if peak <= 0:
+        return [0] * len(counts)
+    # sqrt keeps a single touch visible next to a busy lane
+    return [0 if c == 0 else max(1, round((c / peak) ** 0.5 * (len(SPARK) - 1))) for c in counts]
+
+
+def watch_stream(tail):
+    """Not a terminal: one line per touch, forever."""
+    cwd = os.path.realpath(os.getcwd())
+    tail.poll()  # skip history; stream what happens from now on
+    while True:
+        for ev in tail.poll():
+            t = Touch(ev.ts, ev.session, ev.transcript, ev.tool)
+            stamp = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
+            print(f"{stamp} {t.mark}{paint(ev.session[:8], session_color(ev.session))} "
+                  f"{ev.tool:<5} {show_path(ev.file, cwd)}  {session_title(t)}", flush=True)
+        time.sleep(0.5)
+
+
+class WatchScreen:
+    def __init__(self, scr, tail, span_minutes):
+        import curses
+        self.c, self.scr, self.tail = curses, scr, tail
+        self.span_i = SPANS.index(span_minutes) if span_minutes in SPANS else SPANS.index(60)
+        self.paused, self.frozen = False, []
+        self.cwd = os.path.realpath(os.getcwd())
+        self.color_pairs, self.titles_at = {}, 0.0
+        self.frame = 0
+        self._init_colors()
+
+    # -- colors --
+    def _init_colors(self):
+        c = self.c
+        self.has_color = c.has_colors()
+        if not self.has_color:
+            return
+        c.start_color()
+        try:
+            c.use_default_colors()
+            bg = -1
+        except c.error:
+            bg = c.COLOR_BLACK
+        self.palette = PALETTE_256 if c.COLORS >= 256 else PALETTE_8
+        for i, col in enumerate(self.palette):
+            c.init_pair(i + 1, col, bg)
+        base = len(self.palette) + 1
+        dim = 244 if c.COLORS >= 256 else c.COLOR_WHITE
+        c.init_pair(base, dim, bg)                           # dim
+        c.init_pair(base + 1, c.COLOR_YELLOW, bg)            # warning
+        c.init_pair(base + 2, c.COLOR_RED, bg)               # deleted
+        c.init_pair(base + 3, 16 if c.COLORS >= 256 else c.COLOR_BLACK,
+                    75 if c.COLORS >= 256 else c.COLOR_CYAN)  # header bar
+        self.DIM, self.WARN = c.color_pair(base), c.color_pair(base + 1) | c.A_BOLD
+        self.RED, self.BAR = c.color_pair(base + 2), c.color_pair(base + 3) | c.A_BOLD
+
+    def scolor(self, session):
+        if not self.has_color:
+            return 0
+        import zlib
+        return self.c.color_pair(1 + zlib.crc32(session.encode()) % len(self.palette))
+
+    # -- drawing primitives --
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return x
+        text = clip(text, w - x - (1 if y == h - 1 else 0))  # never write the bottom-right cell
+        try:
+            self.scr.addstr(y, x, text, attr)
+        except self.c.error:
+            pass
+        return x + width(text)
+
+    def rule(self, y, label):
+        h, w = self.scr.getmaxyx()
+        x = self.put(y, 0, "── ", self.DIM if self.has_color else self.c.A_DIM)
+        x = self.put(y, x, label, self.c.A_BOLD)
+        self.put(y, x, " " + "─" * max(0, w - x - 1), self.DIM if self.has_color else self.c.A_DIM)
+
+    def dim(self):
+        return self.DIM if self.has_color else self.c.A_DIM
+
+    # -- frame --
+    def draw(self):
+        c, scr = self.c, self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        now = time.time()
+        events = self.frozen if self.paused else self.tail.events
+        span = SPANS[self.span_i] * 60
+        if now - self.titles_at > 30:  # titles change as sessions get renamed
+            _titles.clear()
+            self.titles_at = now
+
+        # header bar
+        sessions_n = len({e.session for e in events})
+        pulse = "◉○"[self.frame % 2] if not self.paused else "‖"
+        left = f" {pulse} cls watch "
+        right = (f" {wmsg('session_count', sessions_n)} · {wmsg('touches', len(events))} · "
+                 f"{datetime.now().strftime('%H:%M:%S')} ")
+        if self.paused:
+            right = f" {wmsg('paused')} ·" + right
+        self.put(0, 0, " " * w, self.BAR if self.has_color else c.A_REVERSE)
+        self.put(0, 0, left, self.BAR if self.has_color else c.A_REVERSE)
+        self.put(0, max(width(left), w - width(right)), right, self.BAR if self.has_color else c.A_REVERSE)
+        y = 2
+
+        if not events:
+            self.put(h // 2, max(0, (w - width(wmsg("waiting"))) // 2), wmsg("waiting"), self.dim())
+            self.put(h - 1, 1, wmsg("keys"), self.dim())
+            scr.refresh()
+            return
+
+        # SESSIONS
+        spark_w = max(10, min(48, w // 3))
+        lanes = session_lanes(events, now, span, spark_w)
+        metas = {l["session"]: (wmsg("file" if len(l["files"]) == 1 else "files", len(l["files"])), ago(l["last"].ts))
+                 for l in lanes}
+        files_w = max(width(f) for f, _ in metas.values())
+        ago_w = max(width(a) for _, a in metas.values())
+        meta_w = files_w + 2 + ago_w
+        title_w = max(8, w - (1 + 2 + 8 + 2 + 1 + spark_w + 2 + meta_w + 1))
+        max_lanes = max(1, min(len(lanes), (h - 8) // 3))
+        peak = max((max(l["counts"]) for l in lanes[:max_lanes]), default=0)
+        self.rule(y, wmsg("sessions"))
+        y += 1
+        for lane in lanes[:max_lanes]:
+            ev, sc = lane["last"], self.scolor(lane["session"])
+            idle = now - ev.ts
+            dot = ("●◉"[self.frame % 2] if idle < 60 else "●") if idle < 600 else "○"
+            x = self.put(y, 1, dot + " ", sc | (c.A_BOLD if idle < 60 else 0))
+            x = self.put(y, x, lane["session"][:8], sc | c.A_BOLD)
+            title = session_title(Touch(ev.ts, ev.session, ev.transcript, ev.tool)) or wmsg("untitled")
+            repo = os.path.basename(ev.cwd.rstrip(os.sep)) if ev.cwd else ""
+            x += 2
+            x0 = x
+            x = self.put(y, x, clip(title, title_w), c.A_BOLD if idle < 600 else 0)
+            if repo and width(title) + width(repo) + 3 <= title_w:
+                self.put(y, x + 1, f"· {repo}", self.dim())
+            x = x0 + title_w + 1
+            for i, lv in enumerate(sparkline(lane["counts"], peak)):
+                if lv:
+                    self.put(y, x + i, SPARK[lv], sc)
+                else:
+                    self.put(y, x + i, "·", self.dim())
+            x += spark_w + 2
+            files, when = metas[lane["session"]]
+            meta = " " * (files_w - width(files)) + files + "  " + " " * (ago_w - width(when)) + when
+            self.put(y, x, meta, self.dim() if idle >= 600 else 0)
+            y += 1
+        if len(lanes) > max_lanes:
+            self.put(y, 3, f"+{len(lanes) - max_lanes} more", self.dim())
+            y += 1
+        # time axis under the sparklines
+        axis_x = 1 + 2 + 8 + 2 + title_w + 1
+        label_l, label_r = f"-{SPANS[self.span_i]}m", "now"
+        self.put(y, axis_x, label_l, self.dim())
+        self.put(y, axis_x + spark_w - len(label_r), label_r, self.dim())
+        mid = f"-{SPANS[self.span_i] // 2}m"
+        self.put(y, axis_x + (spark_w - len(mid)) // 2, mid, self.dim())
+        y += 2
+
+        # CONTESTED
+        contested = contested_files(events, now)
+        if contested and y < h - 6:
+            self.rule(y, "▲ " + wmsg("contested"))
+            y += 1
+            for f, sessions, ts in contested[:min(4, h - y - 5)]:
+                x = self.put(y, 1, "▲ ", self.WARN if self.has_color else c.A_BOLD)
+                badges_w = 11 * len(sessions[:4]) + 10
+                x = self.put(y, x, clip_left(show_path(f, self.cwd), max(10, w - x - badges_w)), c.A_BOLD)
+                x += 2
+                for s, inferred in sessions[:4]:
+                    x = self.put(y, x, ("○~" if inferred else "● ") + s[:6] + "  ", self.scolor(s))
+                self.put(y, x, ago(ts), self.dim())
+                y += 1
+            y += 1
+
+        # TIMELINE
+        if y < h - 2:
+            self.rule(y, wmsg("timeline"))
+            y += 1
+            path_w = max(10, w - 34)
+            exists = {}
+            for row in group_rows(events):
+                if y >= h - 1:
+                    break
+                ev = row[0]
+                fresh = now - ev.ts < FLASH_SECONDS
+                sc = self.scolor(ev.session)
+                stamp = datetime.fromtimestamp(ev.ts).strftime("%H:%M:%S")
+                x = self.put(y, 1, f" {stamp} ", (c.A_REVERSE | c.A_BOLD | sc) if fresh else self.dim())
+                x = self.put(y, x + 1, "▍", sc)
+                x = self.put(y, x, ev.session[:8], sc | (c.A_BOLD if fresh else 0))
+                icon = TOOL_ICON.get(ev.tool, "•")
+                tool = f" {icon} {ev.tool:<5} " if ev.tool != "Bash" else f" {icon} ~bash "
+                x = self.put(y, x + 1, tool, c.A_BOLD if fresh else self.dim())
+                gone = exists.get(ev.file)
+                if gone is None:
+                    gone = exists[ev.file] = not os.path.lexists(ev.file)
+                more = f"  +{len(row) - 1}" if len(row) > 1 else ""
+                path = clip_left(show_path(ev.file, self.cwd), path_w - len(more) - (2 if gone else 0))
+                if gone:
+                    x = self.put(y, x + 1, "✖ ", self.RED if self.has_color else 0)
+                    x = self.put(y, x, path, self.dim())
+                else:
+                    x = self.put(y, x + 1, path, c.A_BOLD if fresh else 0)
+                if more:
+                    self.put(y, x, more, self.dim())
+                y += 1
+
+        self.put(h - 1, 1, wmsg("keys"), self.dim())
+        scr.refresh()
+
+    def run(self):
+        c = self.c
+        try:
+            c.curs_set(0)
+        except c.error:
+            pass
+        self.scr.timeout(500)
+        self.tail.poll()
+        while True:
+            self.tail.poll()
+            self.draw()
+            self.frame += 1
+            key = self.scr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return
+            if key == ord(" "):
+                self.paused = not self.paused
+                self.frozen = list(self.tail.events)
+            elif key in (ord("+"), ord("=")):
+                self.span_i = min(len(SPANS) - 1, self.span_i + 1)
+            elif key in (ord("-"), ord("_")):
+                self.span_i = max(0, self.span_i - 1)
+
+
+def watch_mode(args):
+    import locale
+    locale.setlocale(locale.LC_ALL, "")
+    scope = [os.path.realpath(p) for p in args.paths] or None
+    tail = LogTail(max(args.span * 60, max(SPANS) * 60), scope)
+    if not sys.stdout.isatty():
+        watch_stream(tail)
+        return
+    import curses
+    curses.wrapper(lambda scr: WatchScreen(scr, tail, args.span).run())
+
+
 def main():
     ap = argparse.ArgumentParser(prog="cls", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -305,7 +735,15 @@ def main():
     ap.add_argument("-l", "--long", action="store_true", help="show every session, newest first")
     ap.add_argument("-g", "--git", action="store_true", help="annotate `git status`")
     ap.add_argument("-s", "--session", help="files touched by this session (id prefix)")
+    ap.add_argument("-w", "--watch", action="store_true", help="live timeline")
+    ap.add_argument("--span", type=int, default=60, choices=SPANS, help="sparkline window for -w, minutes")
     args = ap.parse_args()
+    if args.watch:
+        try:
+            watch_mode(args)
+        except KeyboardInterrupt:
+            pass
+        return
     index = load_log()
     if args.session:
         session_mode(args, index)
