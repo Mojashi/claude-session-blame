@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""cls - ls / git status annotated with the Claude Code session that last touched each file.
+
+  cls [-a] [-l] [PATH...]   list a directory (a directory row shows its newest touch)
+  cls -g [-l]               list the files `git status` reports as changed
+  cls -s SESSION [PATH]     list the files one session touched (prefix match on the id)
+
+  -a  include hidden files
+  -l  show every session that touched the file, newest first
+
+Reads $CLAUDE_CONFIG_DIR/touch-log.jsonl (default ~/.claude/touch-log.jsonl), written
+by the session-blame hooks. A "~" before the session id marks a touch inferred from a
+Bash command (the file changed in `git status` while the command ran) rather than
+read from an Edit / Write tool call.
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import unicodedata
+from datetime import datetime, timezone
+
+CLAUDE_DIR = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+LOG = os.path.join(CLAUDE_DIR, "touch-log.jsonl")
+TITLE_KEYS = ('"type":"custom-title"', '"type":"ai-title"')
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+# ---- messages ------------------------------------------------------------
+
+def _is_ja():
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        v = os.environ.get(var)
+        if v:
+            return v.lower().startswith("ja")
+    return False
+
+
+MSG = {
+    "now": ("now", "今"),
+    "m": ("{}m ago", "{}分前"),
+    "h": ("{}h ago", "{}時間前"),
+    "d": ("{}d ago", "{}日前"),
+    "deleted": ("(deleted)", "(削除済み)"),
+    "not_git": ("cls -g: not a git repository", "cls -g: git リポジトリではありません"),
+    "no_session": ("cls -s: no record of {}", "cls -s: {} の記録はありません"),
+    "ambiguous": ("cls -s: matches several sessions: {}", "cls -s: 複数のセッションに一致します: {}"),
+}
+_LANG = 1 if _is_ja() else 0
+
+
+def msg(key, *a):
+    return MSG[key][_LANG].format(*a)
+
+
+# ---- log -----------------------------------------------------------------
+
+class Touch:
+    __slots__ = ("ts", "session", "transcript", "tool")
+
+    def __init__(self, ts, session, transcript, tool):
+        self.ts, self.session, self.transcript, self.tool = ts, session, transcript, tool
+
+    @property
+    def mark(self):
+        return "~" if self.tool == "Bash" else " "
+
+
+def load_log():
+    """realpath -> [Touch], newest first."""
+    by_path, real = {}, {}
+    try:
+        f = open(LOG, encoding="utf-8")
+    except FileNotFoundError:
+        return by_path
+    with f:
+        for line in f:
+            try:
+                e = json.loads(line)
+                ts = datetime.strptime(e["ts"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+                raw = e["file"]
+            except (ValueError, KeyError, TypeError):
+                continue
+            if not raw:
+                continue
+            p = real.get(raw)
+            if p is None:
+                p = real[raw] = os.path.realpath(raw)
+            by_path.setdefault(p, []).append(Touch(ts, e.get("session") or "?", e.get("transcript"), e.get("tool")))
+    for touches in by_path.values():
+        touches.sort(key=lambda t: t.ts, reverse=True)
+    return by_path
+
+
+def per_session_latest(touches):
+    """Keep only the newest touch per session (newest first)."""
+    seen, out = set(), []
+    for t in touches:
+        if t.session not in seen:
+            seen.add(t.session)
+            out.append(t)
+    return out
+
+
+# ---- session titles ------------------------------------------------------
+
+_titles = {}
+
+
+def session_title(touch):
+    """Find the last custom-title / ai-title, reading the transcript backwards
+    (transcripts can be hundreds of MB)."""
+    if touch.session in _titles:
+        return _titles[touch.session]
+    title = ""
+    path = touch.transcript
+    if path and os.path.exists(path):
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            pos, tail, chunk = f.tell(), b"", 1 << 20
+            while pos > 0 and not title:
+                n = min(chunk, pos)
+                pos -= n
+                f.seek(pos)
+                lines = (f.read(n) + tail).split(b"\n")
+                tail = lines[0] if pos > 0 else b""
+                for raw in reversed(lines[1:] if pos > 0 else lines):
+                    s = raw.decode("utf-8", "replace")
+                    if any(k in s for k in TITLE_KEYS):
+                        try:
+                            e = json.loads(s)
+                        except ValueError:
+                            continue
+                        title = e.get("customTitle") or e.get("aiTitle") or ""
+                        if title:
+                            break
+    _titles[touch.session] = title
+    return title
+
+
+# ---- output --------------------------------------------------------------
+
+def ago(ts):
+    d = time.time() - ts
+    if d < 60:
+        return msg("now")
+    if d < 3600:
+        return msg("m", int(d // 60))
+    if d < 86400:
+        return msg("h", int(d // 3600))
+    if d < 86400 * 7:
+        return msg("d", int(d // 86400))
+    return datetime.fromtimestamp(ts).strftime("%m/%d")
+
+
+def paint(s, code):
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+def session_color(session):
+    return 31 + (sum(session.encode()) % 6)  # 31-36: the same session always gets the same color
+
+
+def show_path(p, cwd):
+    """Relative under cwd, otherwise absolute with ~."""
+    rel = os.path.relpath(p, cwd)
+    if not rel.startswith(".."):
+        return rel
+    home = os.path.expanduser("~")
+    return "~" + p[len(home):] if p.startswith(home + os.sep) else p
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def pad(s, w):
+    return s + " " * max(0, w - width(s))
+
+
+def describe(t):
+    return (f"{pad(ago(t.ts), 8)}{t.mark}"
+            f"{paint(t.session[:8], session_color(t.session))}  "
+            f"{session_title(t)}")
+
+
+def print_rows(rows, show_all):
+    """rows: [(label, [Touch] newest first)]."""
+    if not rows:
+        return
+    w = max(width(label) for label, _ in rows)
+    for label, touches in rows:
+        sessions = per_session_latest(touches)
+        if not sessions:
+            print(label)
+            continue
+        head = f"{pad(label, w)}  {describe(sessions[0])}"
+        if not show_all and len(sessions) > 1:
+            head += paint(f"  (+{len(sessions) - 1})", 90)
+        print(head)
+        if show_all:
+            for t in sessions[1:]:
+                print(f"{' ' * w}  {describe(t)}")
+
+
+# ---- modes ---------------------------------------------------------------
+
+def touches_under(index, prefix):
+    out = []
+    for p, ts in index.items():
+        if p == prefix or p.startswith(prefix + os.sep):
+            out.extend(ts)
+    out.sort(key=lambda t: t.ts, reverse=True)
+    return out
+
+
+def ls_mode(paths, args, index):
+    for i, arg in enumerate(paths):
+        target = os.path.realpath(arg)
+        if not os.path.isdir(target):
+            label = arg + ("" if os.path.exists(target) else "  " + msg("deleted"))
+            print_rows([(label, index.get(target, []))], args.long)
+            continue
+        if len(paths) > 1:
+            print(("\n" if i else "") + f"{arg}:")
+        # Group touches by direct child in one pass (deleted children still show up).
+        children = {}
+        for p, ts in index.items():
+            if p.startswith(target + os.sep):
+                children.setdefault(p[len(target) + 1:].split(os.sep, 1)[0], []).extend(ts)
+        names = set(children)
+        names.update(n for n in os.listdir(target) if n != ".git")
+        rows = []
+        for name in sorted(names):
+            if name.startswith(".") and not args.all:
+                continue
+            full = os.path.join(target, name)
+            if os.path.isdir(full):
+                label = name + "/"
+            elif os.path.lexists(full):
+                label = name
+            else:
+                label = name + "  " + msg("deleted")
+            touches = sorted(children.get(name, []), key=lambda t: t.ts, reverse=True)
+            rows.append((label, touches))
+        print_rows(rows, args.long)
+
+
+def git_mode(args, index):
+    try:
+        top = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True,
+                                      stderr=subprocess.DEVNULL).strip()
+        out = subprocess.check_output(["git", "status", "--porcelain=v1", "-z"], cwd=top)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        sys.exit(msg("not_git"))
+    top = os.path.realpath(top)
+    cwd = os.path.realpath(os.getcwd())
+    entries = out.split(b"\0")
+    rows, i = [], 0
+    while i < len(entries):
+        e = entries[i].decode("utf-8", "surrogateescape")
+        i += 1
+        if not e:
+            continue
+        code, path = e[:2], e[3:]
+        if code[0] in "RC":
+            i += 1  # skip the rename source path
+        full = os.path.join(top, path.rstrip("/"))
+        is_dir = path.endswith("/")
+        touches = touches_under(index, full) if is_dir else index.get(full, [])
+        rows.append((f"{code} {os.path.relpath(full, cwd)}{'/' if is_dir else ''}", touches))
+    print_rows(rows, args.long)
+
+
+def session_mode(args, index):
+    scope = os.path.realpath(args.paths[0]) if args.paths else None
+    files = {}
+    for p, ts in index.items():
+        if scope and not (p == scope or p.startswith(scope + os.sep)):
+            continue
+        mine = [t for t in ts if t.session.startswith(args.session)]
+        if mine:
+            files[p] = mine
+    if not files:
+        sys.exit(msg("no_session", args.session))
+    sessions = {t.session for ts in files.values() for t in ts}
+    if len(sessions) > 1:
+        sys.exit(msg("ambiguous", ", ".join(sorted(s[:12] for s in sessions))))
+    first = next(iter(files.values()))[0]
+    print(paint(f"{first.session}  {session_title(first)}", 1))
+    cwd = os.path.realpath(os.getcwd())
+    for p, ts in sorted(files.items(), key=lambda kv: kv[1][0].ts, reverse=True):
+        gone = "" if os.path.lexists(p) else "  " + msg("deleted")
+        print(f"  {pad(ago(ts[0].ts), 8)}{ts[0].mark}{show_path(p, cwd)}{gone}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="cls", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("-a", "--all", action="store_true", help="include hidden files")
+    ap.add_argument("-l", "--long", action="store_true", help="show every session, newest first")
+    ap.add_argument("-g", "--git", action="store_true", help="annotate `git status`")
+    ap.add_argument("-s", "--session", help="files touched by this session (id prefix)")
+    args = ap.parse_args()
+    index = load_log()
+    if args.session:
+        session_mode(args, index)
+    elif args.git:
+        git_mode(args, index)
+    else:
+        ls_mode(args.paths or ["."], args, index)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        pass
